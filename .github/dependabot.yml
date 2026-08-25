@@ -1,0 +1,23 @@
+# Dependency monitoring for artifact-keeper-windows.
+#
+# `github-actions` is the only ecosystem with anything to watch here. This
+# repository is PowerShell (setup.ps1, check.ps1) and carries no package
+# manifest of any kind -- no package.json, no .csproj/.sln, no
+# requirements.txt -- so there is nothing else for Dependabot to read. An
+# entry for an ecosystem with no manifest reads as coverage while producing
+# nothing, so none is added; add one the moment a real manifest lands.
+#
+# Modelled on the backend's .github/dependabot.yml. Its cargo entry and the
+# accompanying RustCrypto/`digest` ignore block are backend-workspace
+# specific and do not apply. Its `reviewers: artifact-keeper/maintainers`
+# names a team that does not exist in this org, so copying it would request
+# review from nobody. Labels are left to Dependabot's own `dependencies`
+# default rather than naming custom labels this repository does not define.
+version: 2
+updates:
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+    commit-message:
+      prefix: "chore"
