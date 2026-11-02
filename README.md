@@ -1,5 +1,12 @@
 # Artifact Keeper Windows Installer
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/artifact-keeper/.github/main/brand/logo-horizontal-dark.png">
+    <img alt="Artifact Keeper" src="https://raw.githubusercontent.com/artifact-keeper/.github/main/brand/logo-horizontal-light.png" width="360">
+  </picture>
+</p>
+
 > **Beta:** Windows support is currently in beta. Please report issues on [GitHub](https://github.com/artifact-keeper/artifact-keeper/issues).
 
 PowerShell-based setup tool for deploying Artifact Keeper and its dependencies on Windows Server.
