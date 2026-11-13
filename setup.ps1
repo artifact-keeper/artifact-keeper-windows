@@ -74,6 +74,9 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = "Stop"
 
+# Use TLS 1.2+ for GitHub and other HTTPS sources
+[Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
@@ -104,9 +107,16 @@ function Write-Log {
     param([string]$Message, [string]$Level = "INFO")
     $ts = Get-Date -Format "yyyy-MM-dd HH:mm:ss"
     $line = "[$ts] [$Level] $Message"
-    if (Test-Path (Split-Path $LogFile -Parent)) {
-        $line | Out-File -Append -FilePath $LogFile -Encoding utf8
+
+    # Ensure log directory exists before writing
+    $logDir = Split-Path $LogFile -Parent
+
+    if (-not (Test-Path $logDir)) {
+        New-Item -ItemType Directory -Path $logDir -Force | Out-Null
     }
+
+    $line | Out-File -Append -FilePath $LogFile -Encoding utf8
+
     switch ($Level) {
         "ERROR" { Write-Host $line -ForegroundColor Red }
         "WARN"  { Write-Host $line -ForegroundColor Yellow }
@@ -122,12 +132,6 @@ function Write-Banner {
     Write-Host ""
 }
 
-function Write-Status {
-    param([string]$Label, [string]$Value, [string]$Color = "White")
-    Write-Host "  $Label" -NoNewline -ForegroundColor Gray
-    Write-Host "  $Value" -ForegroundColor $Color
-}
-
 # ---------------------------------------------------------------------------
 # Download helpers
 # ---------------------------------------------------------------------------
@@ -141,10 +145,10 @@ function Invoke-DownloadWithRetry {
     for ($attempt = 1; $attempt -le $MaxAttempts; $attempt++) {
         try {
             Write-Log "Downloading $Uri (attempt $attempt/$MaxAttempts)"
-            # Use TLS 1.2+ for GitHub and other HTTPS sources
-            [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+            $oldPref = $ProgressPreference
             $ProgressPreference = "SilentlyContinue"
             Invoke-WebRequest -Uri $Uri -OutFile $OutFile -UseBasicParsing
+            $ProgressPreference = $oldPref
             $hash = (Get-FileHash -Path $OutFile -Algorithm SHA256).Hash
             Write-Log "Downloaded $OutFile (SHA256: $hash)"
             return $true
@@ -164,8 +168,10 @@ function Invoke-DownloadWithRetry {
 function Get-LatestGitHubRelease {
     param([Parameter(Mandatory)][string]$Repo)
     try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $oldPref = $ProgressPreference
+        $ProgressPreference = "SilentlyContinue"
         $release = Invoke-RestMethod "https://api.github.com/repos/$Repo/releases/latest"
+        $ProgressPreference = $oldPref
         $tag = $release.tag_name
         Write-Log "Latest release for $Repo : $tag"
         return $tag
@@ -179,9 +185,10 @@ function Get-LatestGitHubRelease {
 function Get-LatestNodeLtsVersion {
     param([string]$Major = "22")
     try {
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        $oldPref = $ProgressPreference
         $ProgressPreference = "SilentlyContinue"
         $releases = Invoke-RestMethod "https://nodejs.org/dist/index.json"
+        $ProgressPreference = $oldPref
         $latest = $releases | Where-Object { $_.version -match "^v$Major\." -and $_.lts } |
             Select-Object -First 1
         if ($latest) {
@@ -202,6 +209,7 @@ function New-SecureRandomString {
     $bytes = New-Object byte[] $ByteCount
     $rng = [System.Security.Cryptography.RandomNumberGenerator]::Create()
     $rng.GetBytes($bytes)
+    $rng.Dispose()
     return [Convert]::ToBase64String($bytes)
 }
 
@@ -265,7 +273,7 @@ function Register-WinSWService {
         Write-Log "Service $ServiceId already registered, reinstalling"
         & $winswDst stop 2>$null
         & $winswDst uninstall 2>$null
-        Start-Sleep -Seconds 2
+        Start-Sleep -Seconds 4
     }
 
     & $winswDst install
@@ -301,7 +309,10 @@ function Install-Backend {
     # Set the environment variable so the backend finds its config
     $envFilePath = Join-Path $DataDir "config\.env"
     [Environment]::SetEnvironmentVariable("AK_ENV_FILE", $envFilePath, "Machine")
-    Write-Log "Set AK_ENV_FILE = $envFilePath (Machine scope)"
+    # Set the environment variable for current script process as well
+    $env:AK_ENV_FILE = $envFilePath
+
+    Write-Log "Set AK_ENV_FILE = $envFilePath (Machine & Process scope)"
 
     # Register as Windows Service using the backend's own --install flag
     Write-Log "Registering ArtifactKeeper service via --install"
@@ -346,15 +357,20 @@ function Install-PostgreSQL {
 
     # Initialize the data directory if it does not exist
     $pgdataMarker = Join-Path $pgDataDir "PG_VERSION"
+    $needsDbSetup = $false
+
     if (-not (Test-Path $pgdataMarker)) {
         # Generate a password for the postgres superuser
         $pgSuperPass = New-SecureRandomString -ByteCount 24
+        $script:PgSuperPassword = $pgSuperPass
 
         Write-Log "Running initdb for data directory $pgDataDir"
         $initdb = Join-Path $pgBinDir "initdb.exe"
-        $env:PGPASSWORD = $pgSuperPass
-        & $initdb -D $pgDataDir -U postgres -A md5 --pwfile=- 2>&1 <<< $pgSuperPass |
-            ForEach-Object { Write-Log $_ }
+
+        $script:PgSuperPassword | & $initdb -D $pgDataDir -U postgres -A md5 --pwfile=- 2>&1 |
+           ForEach-Object { Write-Log $_ }
+
+        $needsDbSetup = $true
     }
 
     # Register as a Windows Service
@@ -368,39 +384,62 @@ function Install-PostgreSQL {
 
     # Start the service so we can create the application database
     Start-Service -Name $ServiceNames.PostgreSQL -ErrorAction SilentlyContinue
-    Start-Sleep -Seconds 3
 
-    # Determine database password
-    $dbPass = $DbPassword
-    if (-not $dbPass) {
-        if ($Unattended) {
-            $dbPass = New-SecureRandomString -ByteCount 24
-            Write-Log "Generated random database password (saved to .env)" "WARN"
-        } else {
-            $securePass = Read-Host "Enter password for the 'registry' database user" -AsSecureString
-            $dbPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
-                [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePass))
+    # Wait for PostgreSQL to become ready
+    $pgIsReady = Join-Path $pgBinDir "pg_isready.exe"
+    Write-Log "Waiting for PostgreSQL to start..."
+    $dbReady = $false
+    for ($i = 0; $i -lt 15; $i++) {
+        & $pgIsReady -h localhost -p $PostgresPort -q
+        if ($LASTEXITCODE -eq 0) {
+            $dbReady = $true
+            break
         }
+        Start-Sleep -Seconds 2
     }
 
-    # Create the application user and database
-    $psql = Join-Path $pgBinDir "psql.exe"
-    $env:PGPASSWORD = $dbPass
+    if (-not $dbReady) {
+        Write-Log "PostgreSQL failed to start after 30 seconds." "ERROR"
+        return $false
+    }
 
-    Write-Log "Creating database user 'registry' and database 'artifact_registry'"
-    & $psql -h localhost -p $PostgresPort -U postgres -c "DO `$`$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'registry') THEN CREATE ROLE registry WITH LOGIN PASSWORD '$dbPass'; END IF; END `$`$;" 2>&1 |
-        ForEach-Object { Write-Log $_ }
-
-    & $psql -h localhost -p $PostgresPort -U postgres -c "SELECT 1 FROM pg_database WHERE datname = 'artifact_registry'" -t 2>&1 |
-        ForEach-Object {
-            if ($_.Trim() -ne "1") {
-                & $psql -h localhost -p $PostgresPort -U postgres -c "CREATE DATABASE artifact_registry OWNER registry;" 2>&1 |
-                    ForEach-Object { Write-Log $_ }
+    # Only create role and database if we just initialized the data directory
+    if ($needsDbSetup -and $script:PgSuperPassword) {
+        $dbPass = $DbPassword
+        if (-not $dbPass) {
+            if ($Unattended) {
+                $dbPass = New-SecureRandomString -ByteCount 24
+                Write-Log "Generated random database password (saved to .env)" "WARN"
+            } else {
+                $securePass = Read-Host "Enter password for the 'registry' database user" -AsSecureString
+                $dbPass = [Runtime.InteropServices.Marshal]::PtrToStringAuto(
+                    [Runtime.InteropServices.Marshal]::SecureStringToBSTR($securePass))
             }
         }
 
-    # Store password for .env generation
-    $script:ResolvedDbPassword = $dbPass
+        # Prevent SQL syntax errors because of single quotes
+        $escapedDbPass = $dbPass -replace "'", "''"
+
+        # Authenticate as superuser to configure the new user
+        $env:PGPASSWORD = $script:PgSuperPassword
+        $psql = Join-Path $pgBinDir "psql.exe"
+
+        Write-Log "Creating database user 'registry' and database 'artifact_registry'"
+        & $psql -h localhost -p $PostgresPort -U postgres -c "DO `$`$ BEGIN IF NOT EXISTS (SELECT FROM pg_roles WHERE rolname = 'registry') THEN CREATE ROLE registry WITH LOGIN PASSWORD '$escapedDbPass'; END IF; END `$`$;" 2>&1 |
+            ForEach-Object { Write-Log $_ }
+
+        # Check if the database exists
+        $dbExists = & $psql -h localhost -p $PostgresPort -U postgres -t -A -c "SELECT 1 FROM pg_database WHERE datname = 'artifact_registry'" 2>&1
+        if ($dbExists.Trim() -ne "1") {
+            & $psql -h localhost -p $PostgresPort -U postgres -c "CREATE DATABASE artifact_registry OWNER registry;" 2>&1 | ForEach-Object { Write-Log $_ }
+        }
+
+        # Store password for .env generation
+        $script:ResolvedDbPassword = $dbPass
+    } else {
+        Write-Log "PostgreSQL data exists. Skipping user/database creation." "INFO"
+    }
+
     Write-Log "PostgreSQL $fullVersion installed" "OK"
     return $true
 }
@@ -433,7 +472,7 @@ function Install-Meilisearch {
 
     $xml = @"
 <service>
-  <id>Meilisearch</id>
+  <id>$($ServiceNames.Meilisearch)</id>
   <name>Meilisearch</name>
   <description>Meilisearch search engine for Artifact Keeper</description>
   <executable>$exePath</executable>
@@ -447,7 +486,7 @@ function Install-Meilisearch {
 </service>
 "@
 
-    $registered = Register-WinSWService -ServiceDir $msDir -ServiceId "Meilisearch" -XmlContent $xml
+    $registered = Register-WinSWService -ServiceDir $msDir -ServiceId $ServiceNames.Meilisearch -XmlContent $xml
     if (-not $registered) { return $false }
 
     Write-Log "Meilisearch v$version installed" "OK"
@@ -483,7 +522,7 @@ function Install-Trivy {
 
     $xml = @"
 <service>
-  <id>Trivy</id>
+  <id>$($ServiceNames.Trivy)</id>
   <name>Trivy</name>
   <description>Trivy vulnerability scanner for Artifact Keeper</description>
   <executable>$exePath</executable>
@@ -497,7 +536,7 @@ function Install-Trivy {
 </service>
 "@
 
-    $registered = Register-WinSWService -ServiceDir $trivyDir -ServiceId "Trivy" -XmlContent $xml
+    $registered = Register-WinSWService -ServiceDir $trivyDir -ServiceId $ServiceNames.Trivy -XmlContent $xml
     if (-not $registered) { return $false }
 
     Write-Log "Trivy v$version installed" "OK"
@@ -532,10 +571,10 @@ function Install-Frontend {
         $tempDir = Join-Path $InstallDir "node-temp"
         Expand-Archive -Path $nodeZip -DestinationPath $tempDir -Force
         # The ZIP contains a top-level folder like node-v22.16.0-win-x64
-        $innerDir = Get-ChildItem -Path $tempDir -Directory | Select-Object -First 1
-        if ($innerDir) {
+        $innerDirs = Get-ChildItem -Path $tempDir -Directory
+        if ($innerDirs.Count -gt 0) {
             if (Test-Path $nodeDir) { Remove-Item $nodeDir -Recurse -Force }
-            Move-Item -Path $innerDir.FullName -Destination $nodeDir
+            Move-Item -Path $innerDirs[0].FullName -Destination $nodeDir
         }
         Remove-Item $tempDir -Recurse -Force -ErrorAction SilentlyContinue
         Remove-Item $nodeZip -Force
@@ -567,7 +606,7 @@ function Install-Frontend {
 
     $xml = @"
 <service>
-  <id>ArtifactKeeperWeb</id>
+  <id>$($ServiceNames.Frontend)</id>
   <name>Artifact Keeper Web</name>
   <description>Artifact Keeper web frontend (Next.js)</description>
   <executable>$nodeExe</executable>
@@ -585,7 +624,7 @@ function Install-Frontend {
 </service>
 "@
 
-    $registered = Register-WinSWService -ServiceDir $webDir -ServiceId "ArtifactKeeperWeb" -XmlContent $xml
+    $registered = Register-WinSWService -ServiceDir $webDir -ServiceId $ServiceNames.Frontend -XmlContent $xml
     if (-not $registered) { return $false }
 
     Write-Log "Web frontend v$webVersion installed" "OK"
@@ -600,6 +639,12 @@ function Write-EnvConfig {
     param([bool]$PostgresLocal, [bool]$MeilisearchLocal, [bool]$TrivyLocal)
 
     $envFile = Join-Path $DataDir "config\.env"
+
+    # If upgrading or rerunning, preserve the existing configuration
+    if (Test-Path $envFile) {
+        Write-Log "Existing .env file found. Skipping configuration generation to preserve secrets." "OK"
+        return
+    }
 
     $dbPassword = if ($script:ResolvedDbPassword) { $script:ResolvedDbPassword } elseif ($DbPassword) { $DbPassword } else { "changeme" }
     $dbUrl = "postgresql://registry:${dbPassword}@localhost:${PostgresPort}/artifact_registry"
@@ -660,9 +705,9 @@ function Write-EnvConfig {
 function Start-AllServices {
     $order = @(
         $ServiceNames.PostgreSQL
-        $ServiceNames.Backend
         $ServiceNames.Meilisearch
         $ServiceNames.Trivy
+        $ServiceNames.Backend
         $ServiceNames.Frontend
     )
     Write-Host ""
@@ -672,7 +717,7 @@ function Start-AllServices {
             try {
                 if ($s.Status -ne "Running") {
                     Start-Service -Name $svc
-                    Start-Sleep -Seconds 2
+                    Start-Sleep -Seconds 4
                 }
                 $s = Get-Service -Name $svc
                 $port = switch ($svc) {
@@ -697,9 +742,9 @@ function Start-AllServices {
 function Stop-AllServices {
     $order = @(
         $ServiceNames.Frontend
+        $ServiceNames.Backend
         $ServiceNames.Trivy
         $ServiceNames.Meilisearch
-        $ServiceNames.Backend
         $ServiceNames.PostgreSQL
     )
     foreach ($svc in $order) {
@@ -722,11 +767,11 @@ function Invoke-CheckMode {
 
     $components = @(
         @{ Name = "Backend";     Exe = "bin\artifact-keeper.exe";         Service = $ServiceNames.Backend;     Port = $ApiPort;         HealthUrl = "http://localhost:${ApiPort}/health" }
-        @{ Name = "PostgreSQL";  Exe = "postgresql\pgsql\bin\psql.exe"; Service = $ServiceNames.PostgreSQL;  Port = $PostgresPort;    HealthUrl = $null }
-        @{ Name = "Meilisearch"; Exe = "meilisearch\meilisearch.exe";   Service = $ServiceNames.Meilisearch; Port = $MeilisearchPort; HealthUrl = "http://localhost:${MeilisearchPort}/health" }
-        @{ Name = "Trivy";       Exe = "trivy\trivy.exe";               Service = $ServiceNames.Trivy;       Port = $TrivyPort;       HealthUrl = $null }
-        @{ Name = "Node.js";     Exe = "nodejs\node.exe"; Service = $null; Port = $null; HealthUrl = $null }
-        @{ Name = "Frontend";    Exe = "web\server.js"; Service = $ServiceNames.Frontend; Port = $WebPort; HealthUrl = "http://localhost:${WebPort}" }
+        @{ Name = "PostgreSQL";  Exe = "postgresql\pgsql\bin\psql.exe";   Service = $ServiceNames.PostgreSQL;  Port = $PostgresPort;    HealthUrl = $null }
+        @{ Name = "Meilisearch"; Exe = "meilisearch\meilisearch.exe";     Service = $ServiceNames.Meilisearch; Port = $MeilisearchPort; HealthUrl = "http://localhost:${MeilisearchPort}/health" }
+        @{ Name = "Trivy";       Exe = "trivy\trivy.exe";                 Service = $ServiceNames.Trivy;       Port = $TrivyPort;       HealthUrl = $null }
+        @{ Name = "Node.js";     Exe = "nodejs\node.exe";                 Service = $null;                     Port = $null;            HealthUrl = $null }
+        @{ Name = "Frontend";    Exe = "web\server.js";                   Service = $ServiceNames.Frontend;    Port = $WebPort;         HealthUrl = "http://localhost:${WebPort}" }
     )
 
     foreach ($c in $components) {
@@ -793,9 +838,9 @@ function Invoke-Uninstall {
 
     # Unregister WinSW-based services
     $winswServices = @(
-        @{ Dir = "meilisearch"; Id = "Meilisearch" }
-        @{ Dir = "trivy"; Id = "Trivy" }
-        @{ Dir = "web"; Id = "ArtifactKeeperWeb" }
+        @{ Dir = "meilisearch"; Id = $ServiceNames.Meilisearch }
+        @{ Dir = "trivy";       Id = $ServiceNames.Trivy }
+        @{ Dir = "web";         Id = $ServiceNames.Frontend }
     )
     foreach ($ws in $winswServices) {
         $svcExe = Join-Path $InstallDir "$($ws.Dir)\$($ws.Id)-service.exe"
@@ -831,15 +876,18 @@ function Invoke-Uninstall {
         $removeData = ($answer -eq "y" -or $answer -eq "Y")
     }
 
-    Write-Log "Removing installation directory: $InstallDir"
-    if ($removeData -or ($DataDir -like "$InstallDir*")) {
-        Remove-Item -Path $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
-    } else {
-        # Remove everything except the data directory
-        Get-ChildItem -Path $InstallDir -Exclude "data" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+    if (-not [string]::IsNullOrWhiteSpace($InstallDir) -and $InstallDir.Length -gt 3 -and (Test-Path $InstallDir)) {
+        Write-Log "Removing installation directory: $InstallDir"
+
+        if ($removeData -or ($DataDir -notlike "$InstallDir*")) {
+            Remove-Item -Path $InstallDir -Recurse -Force -ErrorAction SilentlyContinue
+        } else {
+            # Remove everything except the data directory
+            Get-ChildItem -Path $InstallDir -Exclude "data" | Remove-Item -Recurse -Force -ErrorAction SilentlyContinue
+        }
     }
 
-    if ($removeData -and $DataDir -notlike "$InstallDir*") {
+    if ($removeData -and -not [string]::IsNullOrWhiteSpace($DataDir) -and $DataDir.Length -gt 3 -and $DataDir -notlike "$InstallDir*") {
         Write-Log "Removing data directory: $DataDir"
         Remove-Item -Path $DataDir -Recurse -Force -ErrorAction SilentlyContinue
     }
@@ -930,6 +978,7 @@ function Show-InteractiveMenu {
 # ---------------------------------------------------------------------------
 
 # Initialize script-scope variables for cross-component state
+$script:PgSuperPassword = $null
 $script:ResolvedDbPassword = $null
 $script:MeilisearchMasterKey = $null
 
