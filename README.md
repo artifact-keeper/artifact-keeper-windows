@@ -7,6 +7,8 @@
   </picture>
 </p>
 
+[![Discord](https://img.shields.io/discord/1527760136456900748?label=Discord&logo=discord&logoColor=white)](https://discord.gg/8T7NW2PeS2)
+
 > **Beta:** Windows support is currently in beta. Please report issues on [GitHub](https://github.com/artifact-keeper/artifact-keeper/issues).
 
 PowerShell-based setup tool for deploying Artifact Keeper and its dependencies on Windows Server.
@@ -128,6 +130,13 @@ Or use the built-in check mode:
 ## How services are managed
 
 The backend binary has native Windows Service support and registers itself using the `--install` flag. PostgreSQL registers via `pg_ctl register`. Meilisearch, Trivy, and the web frontend use [WinSW](https://github.com/winsw/winsw) as a lightweight service wrapper. WinSW is downloaded once and copied per service.
+
+## Community
+
+- **Discord**: chat, quick help and per-ecosystem channels at [discord.gg/8T7NW2PeS2](https://discord.gg/8T7NW2PeS2)
+- **GitHub Discussions**: [ideas and Q&A](https://github.com/artifact-keeper/artifact-keeper/discussions)
+- **Issues**: confirmed bugs go in the [issue tracker](https://github.com/artifact-keeper/artifact-keeper-windows/issues)
+- **Security**: report vulnerabilities privately as described in [SECURITY.md](https://github.com/artifact-keeper/artifact-keeper/blob/main/SECURITY.md), never in Discord or public issues
 
 ## License
 
